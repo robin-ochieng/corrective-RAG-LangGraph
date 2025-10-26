@@ -151,6 +151,10 @@ data/
 models/
 *.db
 *.sqlite
+vectorstores/chroma/*
+!vectorstores/chroma/.gitkeep
+vectorstores/faiss/*
+!vectorstores/faiss/.gitkeep
 
 # Logs
 logs/

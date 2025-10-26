@@ -18,6 +18,9 @@ tavily-python = "*"
 langchain-openai = "*"
 python-dotenv = "*"
 langchain-chroma = "*"
+faiss-cpu = "*"
+pypdf = "*"
+langchain-text-splitters = "*"
 
 [tool.poetry.group.dev.dependencies]
 black = "*"

@@ -63,6 +63,16 @@ corrective-rag-langgraph/
 
 ## Usage
 
+### Ingest the knowledge base
+
+```bash
+poetry run python ingestion/pipeline.py
+```
+
+The command loads all PDFs under `knowledge_base/` and the URLs listed in `knowledge_base/urls`, chunks the content, and writes embeddings to both `vectorstores/chroma/` and `vectorstores/faiss/`. Set `OPENAI_API_KEY` in `.env` (or provide a custom embeddings class) before running.
+
+### Query the system
+
 ```python
 from corrective_rag import CorrectiveRAG
 
