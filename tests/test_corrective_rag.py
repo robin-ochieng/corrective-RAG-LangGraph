@@ -30,15 +30,51 @@ def clear_llm_env(monkeypatch):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
 
 
+class EchoChain:
+    def __init__(self):
+        self.calls = []
+
+    def invoke(self, inputs):
+        self.calls.append(inputs)
+        return f"Answering: {inputs['question']}"
+
+
+class FakeTavilyClient:
+    def __init__(self, results=None):
+        self.results = results or []
+        self.calls = []
+
+    def search(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"results": self.results}
+
+
+class AlwaysYesGrader:
+    def invoke(self, inputs):
+        return RelevanceScore(binary_score="yes")
+
+
+def make_default_overrides() -> dict:
+    return {
+        "document_grader": DocumentGraderNode(chain=AlwaysYesGrader()),
+        "web_search": WebSearchNode(client=FakeTavilyClient(), config={"always_search": False}),
+        "generation": GenerationNode(chain=EchoChain()),
+    }
+
+
 def test_corrective_rag_initialization():
     """Test that CorrectiveRAG can be initialized."""
-    rag = CorrectiveRAG()
+    rag = CorrectiveRAG(
+        config={"graph": {"use_llm_nodes": True, "overrides": make_default_overrides()}}
+    )
     assert rag is not None
 
 
 def test_corrective_rag_query():
     """Test basic query functionality."""
-    rag = CorrectiveRAG()
+    rag = CorrectiveRAG(
+        config={"graph": {"use_llm_nodes": True, "overrides": make_default_overrides()}}
+    )
     response = rag.query("What is machine learning?")
     assert isinstance(response, str)
     assert "No relevant documents" in response
@@ -46,9 +82,9 @@ def test_corrective_rag_query():
 
 def test_corrective_rag_with_config():
     """Test initialization with configuration."""
-    config = {"debug": True}
+    config = {"graph": {"use_llm_nodes": True, "overrides": make_default_overrides()}}
     rag = CorrectiveRAG(config=config)
-    assert rag.config == config
+    assert rag.config["graph"]["use_llm_nodes"] is True
 
 
 class DummyEmbeddings(Embeddings):
@@ -106,15 +142,17 @@ def test_corrective_rag_retrieval(tmp_path: Path, dummy_embedding: "DummyEmbeddi
                 "embedding": dummy_embedding,
                 "top_k": 3,
             },
+            "graph": {"use_llm_nodes": True, "overrides": make_default_overrides()},
         }
     )
 
     answer = rag.query("What is machine learning?")
 
-    assert "Top match" in answer
+    assert answer.startswith("Answering:")
     assert rag.last_state is not None
     assert rag.last_state.retrieved_documents
     assert "machine learning" in rag.last_state.retrieved_documents[0].page_content.lower()
+    assert rag.last_state.metadata["generation"]["used_documents"] >= 1
 
 
 def test_retrieve_node_updates_state(
@@ -189,16 +227,6 @@ def test_document_grader_filters_documents():
     assert updated.metadata["retrieval"]["dropped_documents"] == 1
     assert updated.metadata["web_search_required"] is True
 
-class FakeTavilyClient:
-    def __init__(self, results):
-        self.results = results
-        self.calls = []
-
-    def search(self, **kwargs):
-        self.calls.append(kwargs)
-        return {"results": self.results}
-
-
 def test_web_search_node_adds_documents():
     client = FakeTavilyClient(
         [
@@ -258,15 +286,6 @@ def test_web_search_node_skips_when_not_required():
 
     assert updated.metadata["web_search"]["performed"] is False
     assert not client.calls
-
-
-class EchoChain:
-    def __init__(self):
-        self.calls = []
-
-    def invoke(self, inputs):
-        self.calls.append(inputs)
-        return f"Answering: {inputs['question']}"
 
 
 def test_generation_node_produces_answer():

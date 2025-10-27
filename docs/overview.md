@@ -29,14 +29,14 @@ The goal is to build a Retrieval-Augmented Generation (RAG) system that doesn’
 - **RetrieveNode (`nodes/retrieve.py`):**
   - Reads the question from `GraphState`, fetches relevant documents via the retriever, and stores them on the state.
 - **DocumentGraderNode (`nodes/document_grader.py`):**
-  - Runs an LLM-powered relevance grader with structured Pydantic output (or a heuristic grader in offline mode).
+  - Runs an LLM-powered relevance grader with structured Pydantic output.
   - Filters out non-relevant documents and flags the state for web search when the kept context is too thin.
 - **WebSearchNode (`nodes/web_search.py`):**
   - Calls the Tavily API when more evidence is required and appends fresh documents to the state.
   - Records query metadata and toggles the `web_search_required` flag depending on whether useful context was found.
 - **GenerationNode (`nodes/generation.py`):**
   - Crafts the final answer using a RAG prompt, combining retrieved and web-sourced context with the user’s question.
-  - Supports configurable LLMs, source annotations, and exposes the last prompt for observability. Falls back to a heuristic answer generator when LLM credentials are absent.
+  - Supports configurable LLMs, source annotations, and exposes the last prompt for observability.
 - **GraphState (`nodes/state.py`):**
   - The shared data structure carrying question, retrieved docs, critiques, flags, and metadata through the graph.
 
@@ -44,9 +44,9 @@ The goal is to build a Retrieval-Augmented Generation (RAG) system that doesn’
 - **File:** `src/corrective_rag/core.py`
 - **Responsibilities:**
   - Initialize ingestion pipeline and retriever.
-  - Build and compile the LangGraph via `build_corrective_rag_graph`, wiring in heuristic node overrides when API keys are unavailable.
-  - Auto-detect whether OpenAI/Tavily credentials are available: real LLM/web-search nodes are enabled when keys exist (or when `graph.use_llm_nodes=True`), otherwise heuristic stand-ins keep the pipeline offline-friendly.
-  - Provide the high-level `query` interface that now executes the compiled graph (with conditional branching into web search) and falls back to the legacy retrieval flow on error.
+  - Build and compile the LangGraph via `build_corrective_rag_graph`, defaulting to LLM-powered nodes for grading and generation.
+  - Require OpenAI credentials unless custom overrides supply substitute nodes; Tavily remains optional (a no-op web search node is injected automatically when the API key is absent).
+  - Provide the high-level `query` interface that executes the compiled graph (with conditional branching into web search) and falls back to a simple retrieval summary only if the graph cannot be constructed (e.g., retriever unavailable).
   - Store the latest `GraphState` for inspection, including metadata about retrieval, grading, web search, and generation.
 
 ### 5. Command-Line Entry Point
@@ -80,25 +80,21 @@ corrective-rag-langgraph/
 ## Current Behaviour Flow
 1. Ingest knowledge base (optional, but required for retrieval).
 2. Build the LangGraph via `build_corrective_rag_graph` (or rely on `CorrectiveRAG` to do so lazily).
-3. Execute the graph, which currently flows through:
-  - `RetrieveNode`
-  - `DocumentGraderNode` → if documents are dropped, branch to `WebSearchNode`
-  - `WebSearchNode` (optional, conditional on `web_search_required`)
-  - `GenerationNode`
-- `DocumentGraderNode` → if documents are dropped, branch to `WebSearchNode`
-- `WebSearchNode` (optional, conditional on `web_search_required`)
-- `GenerationNode`
+3. Execute the graph, which currently flows through `RetrieveNode → DocumentGraderNode → (optional) WebSearchNode → GenerationNode` with conditional branching into web search when grading determines extra context is needed.
 4. Inspect the final `GraphState` for diagnostics, retrieved docs, and metadata flags.
 
 ### Credential Handling & Overrides
-- Set `OPENAI_API_KEY` and `TAVILY_API_KEY` (or provide `graph.openai_api_key` / `graph.tavily_api_key`) to activate the full corrective RAG path automatically.
+- Set `OPENAI_API_KEY` (or provide `graph.openai_api_key`) to run the default corrective RAG graph. Without it you must supply custom overrides for the LLM-backed nodes.
+- Provide `TAVILY_API_KEY` (or `graph.tavily_api_key`) to enable live web search; if omitted, a no-op web-search node is injected so the graph still executes.
 - Optionally set `graph.user_agent` (or `USER_AGENT`) so outbound tool requests identify the application; defaults to `corrective-rag-langgraph/0.1.0` when not provided.
-- Without credentials, the system swaps in lightweight heuristics (`HeuristicDocumentGraderChain`, `OfflineWebSearchNode`, `SimpleGenerationNode`) so local workflows continue to function.
-- Force a specific behaviour via `graph.use_llm_nodes=True/False`. When set to `True`, missing credentials raise an error unless custom overrides are supplied.
+- Force a specific behaviour via `graph.use_llm_nodes=True/False`. When set to `True` (the default), missing OpenAI credentials raise an error unless custom overrides are supplied.
 - Provide bespoke components through `graph.overrides` (e.g., inject a custom retriever grader, web-search client, or generator) which also sidesteps the default credential checks for those nodes.
 
 ## Pending & Upcoming Work
-- **LLM-backed execution path:** Allow end users to opt into the full LLM nodes via `config['graph']['use_llm_nodes']=True` (currently defaults to heuristic substitutes).
+- **Reasoning / correction loops:** Add nodes for iterative drafts, critique, self-correction, and retries beyond the linear path.
+- **Robust tool integrations:** Expand web search/tooling coverage (Tavily is optional but supported), add evaluators and telemetry hooks.
+- **Configuration ergonomics:** Surface richer config (env files, CLI) for swapping embeddings, LLMs, and node overrides without code edits.
+- **Quality evaluation:** Add automated metrics/tests around answer quality and corrective behaviour.
 - **Reasoning / correction loops:** Add nodes for iterative drafts, critique, self-correction, and retries beyond the linear path.
 - **Robust tool integrations:** Expand web search/tooling coverage (Tavily is plugged in but optional), add evaluators and telemetry hooks.
 - **Configuration ergonomics:** Surface richer config (env files, CLI) for swapping embeddings, LLMs, and node overrides without code edits.

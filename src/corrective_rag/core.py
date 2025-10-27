@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -13,9 +12,8 @@ from langchain_core.embeddings import Embeddings
 
 from .graph import build_corrective_rag_graph
 from .ingestion import IngestionPipeline, IngestionResult
-from .nodes import GraphState, RelevanceScore
+from .nodes import GraphState
 from .nodes.base import BaseNode
-from .nodes.document_grader import DocumentGraderNode
 from .retrievers import RetrievalResult, VectorRetriever
 
 # Load environment variables
@@ -29,97 +27,6 @@ if not os.getenv("USER_AGENT"):
 
 
 logger = logging.getLogger(__name__)
-
-
-class HeuristicDocumentGraderChain:
-    """Lightweight scorer that keeps documents containing question keywords."""
-
-    def __init__(self, min_keyword_length: int = 3) -> None:
-        self.min_keyword_length = min_keyword_length
-
-    def invoke(self, inputs) -> RelevanceScore:
-        question = inputs.get("question", "")
-        document = inputs.get("document", "")
-
-        keywords = [
-            token
-            for token in re.findall(r"\b\w+\b", question.lower())
-            if len(token) >= self.min_keyword_length
-        ]
-
-        if not keywords:
-            return RelevanceScore(binary_score="yes")
-
-        doc_text = document.lower()
-        relevant = any(keyword in doc_text for keyword in keywords)
-        return RelevanceScore(binary_score="yes" if relevant else "no")
-
-
-class OfflineWebSearchNode(BaseNode):
-    """No-op web search node used when an external API is unavailable."""
-
-    name = "web_search"
-
-    def __init__(self, *, config: Optional[Dict] = None) -> None:
-        super().__init__(config=config)
-        self.always_search = bool(self.config.get("always_search", False))
-
-    def run(self, state: GraphState) -> GraphState:  # type: ignore[override]
-        should_search = self.always_search or state.metadata.get("web_search_required", False)
-
-        state.metadata.setdefault("web_search", {})
-        state.metadata["web_search"].update(
-            {
-                "performed": bool(should_search),
-                "query": None,
-                "results": 0,
-                "documents_added": 0,
-            }
-        )
-
-        state.metadata["web_search_required"] = False
-        return state
-
-
-class SimpleGenerationNode(BaseNode):
-    """Heuristic answer generator mirroring the legacy fallback response."""
-
-    name = "generation"
-
-    def __init__(self, *, config: Optional[Dict] = None) -> None:
-        super().__init__(config=config)
-
-    def run(self, state: GraphState) -> GraphState:  # type: ignore[override]
-        used_documents = len(state.retrieved_documents)
-
-        if used_documents == 0:
-            answer = (
-                "No relevant documents were retrieved. Try ingesting more data or "
-                "adjusting your question."
-            )
-            context_chars = 0
-        else:
-            top_doc = state.retrieved_documents[0]
-            snippet = top_doc.page_content.strip().replace("\n", " ")[:280]
-            source = top_doc.metadata.get("source", "unknown source")
-            answer = (
-                f"Top match from {source}:\n"
-                f"{snippet}...\n\n"
-                "(Full answer generation not yet implemented.)"
-            )
-            context_chars = sum(len(doc.page_content) for doc in state.retrieved_documents)
-
-        state.final_answer = answer
-        state.metadata.setdefault("generation", {})
-        state.metadata["generation"].update(
-            {
-                "used_documents": used_documents,
-                "context_chars": context_chars,
-                "strategy": "simple_fallback",
-            }
-        )
-
-        return state
 
 
 class CorrectiveRAG:
@@ -167,40 +74,15 @@ class CorrectiveRAG:
     def _missing_credentials(self, overrides: Dict[str, Any]) -> List[str]:
         missing: List[str] = []
 
-        openai_needed = (
-            "document_grader" not in overrides or overrides.get("document_grader") is None
-        ) or (
-            "generation" not in overrides or overrides.get("generation") is None
+        needs_openai = not all(
+            name in overrides and overrides[name] is not None
+            for name in ("document_grader", "generation")
         )
 
-        if openai_needed and not self._has_openai_credentials():
+        if needs_openai and not self._has_openai_credentials():
             missing.append("OPENAI_API_KEY")
 
-        tavily_needed = "web_search" not in overrides or overrides.get("web_search") is None
-        if tavily_needed and not self._has_tavily_credentials():
-            missing.append("TAVILY_API_KEY")
-
         return missing
-
-    def _determine_llm_usage(
-        self,
-        graph_config: Dict[str, Any],
-        overrides: Dict[str, Any],
-    ) -> tuple[bool, List[str]]:
-        missing = self._missing_credentials(overrides)
-        explicit = graph_config.get("use_llm_nodes")
-
-        if explicit is None:
-            return len(missing) == 0, missing
-
-        use_llm = bool(explicit)
-        if use_llm and missing:
-            creds = ", ".join(missing)
-            raise EnvironmentError(
-                "use_llm_nodes=True requires configured credentials. Missing: " f"{creds}"
-            )
-
-        return use_llm, missing
 
     def _setup_components(self):
         """Set up the various components of the RAG system."""
@@ -215,40 +97,48 @@ class CorrectiveRAG:
         if self.retriever is None:
             return
 
-        graph_section = self.config.get("graph", {})
+        graph_section = self.config.get("graph", {}) or {}
         user_overrides = graph_section.get("overrides") or {}
 
         self._set_optional_env_values(graph_section)
 
-        use_llm_nodes, missing_credentials = self._determine_llm_usage(
-            graph_section, user_overrides
-        )
+        use_llm_nodes = bool(graph_section.get("use_llm_nodes", True))
 
-        if not use_llm_nodes and graph_section.get("use_llm_nodes") is None:
+        if use_llm_nodes:
+            missing_credentials = self._missing_credentials(user_overrides)
             if missing_credentials:
-                logger.info(
-                    "Falling back to heuristic nodes; missing credentials: %s",
-                    ", ".join(missing_credentials),
+                creds = ", ".join(missing_credentials)
+                raise EnvironmentError(
+                    f"OPENAI credentials are required for corrective RAG. Missing: {creds}"
                 )
 
-        default_overrides = {}
-        if not use_llm_nodes:
-            heuristic_chain = HeuristicDocumentGraderChain()
-            default_overrides = {
-                "document_grader": DocumentGraderNode(
-                    chain=heuristic_chain,
-                    config=graph_section.get("document_grader"),
-                ),
-                "web_search": OfflineWebSearchNode(
-                    config=graph_section.get("web_search"),
-                ),
-                "generation": SimpleGenerationNode(
-                    config=graph_section.get("generation"),
-                ),
-            }
+        node_overrides = dict(user_overrides)
 
-        # User-provided overrides take precedence over defaults.
-        node_overrides = {**default_overrides, **user_overrides}
+        if "web_search" not in node_overrides and not self._has_tavily_credentials():
+            class _NullWebSearchNode(BaseNode):
+                name = "web_search"
+
+                def run(self, state: GraphState) -> GraphState:  # type: ignore[override]
+                    state.metadata.setdefault("web_search", {})
+                    state.metadata["web_search"].update(
+                        {
+                            "performed": False,
+                            "query": None,
+                            "results": 0,
+                            "documents_added": 0,
+                        }
+                    )
+                    state.metadata.setdefault("web_search_required", False)
+                    return state
+
+            node_overrides["web_search"] = _NullWebSearchNode(
+                config=graph_section.get("web_search")
+            )
+
+        graph_section = dict(graph_section)
+        graph_section["use_llm_nodes"] = use_llm_nodes
+        if node_overrides:
+            graph_section["overrides"] = node_overrides
 
         try:
             graph = build_corrective_rag_graph(
@@ -259,7 +149,6 @@ class CorrectiveRAG:
             self._graph_app = graph.compile()
             self._using_llm_nodes = use_llm_nodes and self._graph_app is not None
         except Exception:
-            # Fall back to legacy behaviour if graph setup fails.
             self._graph_app = None
             self._using_llm_nodes = False
 
